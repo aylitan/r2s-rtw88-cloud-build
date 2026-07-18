@@ -55,6 +55,17 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+
+      - name: Upload raw RTW88 IPKs for recovery
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: r2s-rtw88-raw-${{ github.run_id }}
+          path: out/raw-ipks/
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 0
+
       - name: Upload build logs
         if: always()
         uses: actions/upload-artifact@v4

@@ -130,6 +130,147 @@ validate_module() {
   [ "$vermagic" = "$EXPECTED_VERMAGIC" ] || fail "BAD_MODULE_VERMAGIC_$expected_name" 82
 }
 
+# BEGIN OPENWRT TAR IPK COMPAT READER
+#
+# OpenWrt 24.10 ipkg-build creates a gzip-compressed tar archive
+# containing debian-binary, control.tar.gz and data.tar.gz.
+# The helper also retains compatibility with traditional ar IPKs.
+
+REAL_AR_BIN="$(command -v ar)"
+
+[ -n "$REAL_AR_BIN" ] || {
+    echo "RESULT=BAD_REAL_AR_BINARY_NOT_FOUND"
+    exit 60
+}
+
+ar() {
+    local mode="${1:-}"
+    local archive="${2:-}"
+    local member="${3:-}"
+    local clean_member=""
+    local output_member=""
+
+    if [ -n "$archive" ] &&
+       [ -f "$archive" ] &&
+       gzip -t "$archive" >/dev/null 2>&1 &&
+       tar -tzf "$archive" >/dev/null 2>&1
+    then
+        case "$mode" in
+            t|-t)
+                tar -tzf "$archive" |
+                sed 's#^\./##'
+                return
+                ;;
+
+            p|-p)
+                [ -n "$member" ] || return 2
+
+                clean_member="${member#./}"
+
+                if tar -xOzf "$archive" "./${clean_member}" 2>/dev/null; then
+                    return 0
+                fi
+
+                tar -xOzf "$archive" "$clean_member"
+                return
+                ;;
+
+            x|-x)
+                shift 2
+
+                if [ "$#" -eq 0 ]; then
+                    tar -xzf "$archive"
+                    return
+                fi
+
+                for member in "$@"; do
+                    clean_member="${member#./}"
+                    output_member="${clean_member##*/}"
+
+                    if tar -xOzf "$archive" "./${clean_member}" \
+                        > "$output_member" 2>/dev/null
+                    then
+                        :
+                    else
+                        tar -xOzf "$archive" "$clean_member" \
+                            > "$output_member"
+                    fi
+                done
+
+                return
+                ;;
+        esac
+    fi
+
+    "$REAL_AR_BIN" "$@"
+}
+
+echo "===== IPK reader early self-test ====="
+
+IPK_TEST_DIR="$(mktemp -d)"
+
+(
+    set -Eeuo pipefail
+
+    mkdir -p "$IPK_TEST_DIR/control"
+    mkdir -p "$IPK_TEST_DIR/data/lib/modules"
+
+    cat > "$IPK_TEST_DIR/control/control" <<'EOF_TEST_CONTROL'
+Package: ipk-reader-selftest
+Version: 1
+Architecture: aarch64_generic
+Description: OpenWrt tar IPK reader self-test
+EOF_TEST_CONTROL
+
+    printf 'test-module\n' \
+        > "$IPK_TEST_DIR/data/lib/modules/test.ko"
+
+    (
+        cd "$IPK_TEST_DIR/control"
+        tar -czf "$IPK_TEST_DIR/control.tar.gz" ./control
+    )
+
+    (
+        cd "$IPK_TEST_DIR/data"
+        tar -czf "$IPK_TEST_DIR/data.tar.gz" ./lib
+    )
+
+    printf '2.0\n' > "$IPK_TEST_DIR/debian-binary"
+
+    (
+        cd "$IPK_TEST_DIR"
+        tar -czf sample.ipk \
+            ./debian-binary \
+            ./data.tar.gz \
+            ./control.tar.gz
+    )
+
+    ar t "$IPK_TEST_DIR/sample.ipk" |
+        grep -qx 'control.tar.gz'
+
+    ar t "$IPK_TEST_DIR/sample.ipk" |
+        grep -qx 'data.tar.gz'
+
+    ar p "$IPK_TEST_DIR/sample.ipk" control.tar.gz |
+        tar -xzOf - ./control |
+        grep -qx 'Package: ipk-reader-selftest'
+
+    ar p "$IPK_TEST_DIR/sample.ipk" data.tar.gz |
+        tar -xzOf - ./lib/modules/test.ko |
+        grep -qx 'test-module'
+) || {
+    rm -rf "$IPK_TEST_DIR"
+    echo "RESULT=BAD_OPENWRT_IPK_READER_SELFTEST"
+    exit 61
+}
+
+rm -rf "$IPK_TEST_DIR"
+
+echo "IPK_OUTER_FORMAT_SUPPORTED=TAR_GZIP"
+echo "IPK_LEGACY_AR_SUPPORTED=YES"
+echo "IPK_READER_SELFTEST=OK"
+# END OPENWRT TAR IPK COMPAT READER
+
 echo "========== R2S_RTW88_CLOUD_BUILD_BEGIN ==========" | tee "$LOGS/result.txt"
 date -u | tee -a "$LOGS/result.txt"
 echo "ISTOREOS_COMMIT=$ISTOREOS_COMMIT" | tee -a "$LOGS/result.txt"
@@ -248,6 +389,53 @@ do
   grep -Fq "$marker" "$BUILT_FW" || fail BAD_PATCH_MARKER_MISSING 51
 done
 sed -n '/int rtw_fw_write_data_rsvd_page/,/return ret;/p' "$BUILT_FW" > "$ARTIFACT/patched-fw-function.txt"
+
+# BEGIN RAW RTW88 IPK COLLECTION
+#
+# Preserve generated packages before strict validation.
+# The workflow uploads this directory even when validation fails.
+
+RAW_IPK_DIR="${GITHUB_WORKSPACE:-$PWD}/out/raw-ipks"
+RTW88_PACKAGE_DIR="$SRC/bin/targets/rockchip/armv8/packages"
+
+mkdir -p "$RAW_IPK_DIR"
+rm -f "$RAW_IPK_DIR"/*.ipk
+
+for package in \
+    kmod-rtw88 \
+    kmod-rtw88-usb \
+    kmod-rtw88-8822b \
+    kmod-rtw88-8822bu
+do
+    package_file="$(
+        find "$RTW88_PACKAGE_DIR" \
+            -maxdepth 1 \
+            -type f \
+            -name "${package}_*.ipk" \
+            -print |
+        head -n 1
+    )"
+
+    if [ -n "$package_file" ]; then
+        cp -f "$package_file" "$RAW_IPK_DIR/"
+        echo "RAW_IPK_SAVED=$(basename "$package_file")"
+    else
+        echo "RAW_IPK_MISSING=$package"
+    fi
+done
+
+RAW_IPK_COUNT="$(
+    find "$RAW_IPK_DIR" \
+        -maxdepth 1 \
+        -type f \
+        -name '*.ipk' |
+    wc -l |
+    tr -d ' '
+)"
+
+echo "RAW_IPK_DIR=$RAW_IPK_DIR"
+echo "RAW_IPK_COUNT=$RAW_IPK_COUNT"
+# END RAW RTW88 IPK COLLECTION
 
 echo "===== 7. Collect and validate four exact-ABI IPKs =====" | tee -a "$LOGS/result.txt"
 PACKAGES=(kmod-rtw88 kmod-rtw88-usb kmod-rtw88-8822b kmod-rtw88-8822bu)
