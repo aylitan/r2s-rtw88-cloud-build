@@ -176,10 +176,19 @@ echo "===== 3. Configure exact target and required modules =====" | tee -a "$LOG
 cp "$META/config.buildinfo" "$SRC/.config"
 cd "$SRC"
 
-./scripts/config --enable PACKAGE_kmod-rtw88
-./scripts/config --enable PACKAGE_kmod-rtw88-usb
-./scripts/config --enable PACKAGE_kmod-rtw88-8822b
-./scripts/config --enable PACKAGE_kmod-rtw88-8822bu
+for symbol in \
+  CONFIG_PACKAGE_kmod-rtw88 \
+  CONFIG_PACKAGE_kmod-rtw88-usb \
+  CONFIG_PACKAGE_kmod-rtw88-8822b \
+  CONFIG_PACKAGE_kmod-rtw88-8822bu
+do
+  sed -i \
+    -e "/^${symbol}=/d" \
+    -e "/^# ${symbol} is not set$/d" \
+    .config
+
+  printf "%s\n" "${symbol}=y" >> .config
+done
 
 log_run make-defconfig make defconfig
 
