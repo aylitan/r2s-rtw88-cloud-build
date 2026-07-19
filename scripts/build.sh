@@ -49,30 +49,79 @@ set_config_value() {
 
 read_control() {
     local ipk="$1"
-    local member tmp
+    local member tmp tmpdir rc
 
-    member="$(ar t "$ipk" | grep '^control.tar' | head -n 1)"
+    # OpenWrt 24.10 SDK creates .ipk files as gzip-compressed tar archives.
+    # Keep an ar fallback for older/other opkg package formats.
+    tmpdir="$(mktemp -d)"
+    rc=1
+
+    if tar -xzf "$ipk" -C "$tmpdir" >/dev/null 2>&1; then
+        member="$(find "$tmpdir" -maxdepth 1 -type f -name 'control.tar*' -print | head -n 1)"
+        if [ -n "$member" ]; then
+            if tar -xOf "$member" ./control 2>/dev/null ||
+               tar -xOf "$member" control 2>/dev/null; then
+                rc=0
+            fi
+        fi
+        rm -rf "$tmpdir"
+        return "$rc"
+    fi
+
+    rm -rf "$tmpdir"
+    member="$(ar t "$ipk" 2>/dev/null | grep '^control.tar' | head -n 1 || true)"
     [ -n "$member" ] || return 1
 
     tmp="$(mktemp)"
-    ar p "$ipk" "$member" > "$tmp"
-    tar -xOf "$tmp" ./control 2>/dev/null || tar -xOf "$tmp" control
+    if ! ar p "$ipk" "$member" > "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        return 1
+    fi
+
+    rc=1
+    if tar -xOf "$tmp" ./control 2>/dev/null ||
+       tar -xOf "$tmp" control 2>/dev/null; then
+        rc=0
+    fi
     rm -f "$tmp"
+    return "$rc"
 }
 
 extract_ipk_data() {
     local ipk="$1"
     local destination="$2"
-    local member tmp
-
-    member="$(ar t "$ipk" | grep '^data.tar' | head -n 1)"
-    [ -n "$member" ] || return 1
+    local member tmp tmpdir
 
     mkdir -p "$destination"
+
+    tmpdir="$(mktemp -d)"
+    if tar -xzf "$ipk" -C "$tmpdir" >/dev/null 2>&1; then
+        member="$(find "$tmpdir" -maxdepth 1 -type f -name 'data.tar*' -print | head -n 1)"
+        if [ -n "$member" ] && tar -xf "$member" -C "$destination"; then
+            rm -rf "$tmpdir"
+            return 0
+        fi
+        rm -rf "$tmpdir"
+        return 1
+    fi
+
+    rm -rf "$tmpdir"
+    member="$(ar t "$ipk" 2>/dev/null | grep '^data.tar' | head -n 1 || true)"
+    [ -n "$member" ] || return 1
+
     tmp="$(mktemp)"
-    ar p "$ipk" "$member" > "$tmp"
-    tar -xf "$tmp" -C "$destination"
+    if ! ar p "$ipk" "$member" > "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        return 1
+    fi
+
+    if tar -xf "$tmp" -C "$destination"; then
+        rm -f "$tmp"
+        return 0
+    fi
+
     rm -f "$tmp"
+    return 1
 }
 
 echo "========== R2S_RTW88_FINAL_EXACT_ABI_BUILD_BEGIN =========="
@@ -289,37 +338,44 @@ for package in "${PACKAGES[@]}"; do
     control="$LOGS/${package}.control"
     extract_dir="$LOGS/ipk-extracted/$package"
 
+    echo "IPK_FILE=$ipk"
+    file "$ipk" || true
+    sha256sum "$ipk" || true
+
+    # Save every generated target package before metadata validation so that
+    # a parser/checking error can never discard another successful build.
+    cp "$ipk" "$RAW/" || fail "BAD_RAW_COPY_$package" 51
+
     read_control "$ipk" > "$control" ||
-        fail "BAD_CONTROL_$package" 51
+        fail "BAD_CONTROL_$package" 52
 
     cat "$control"
 
     grep -q "^Package: $package$" "$control" ||
-        fail "BAD_PACKAGE_NAME_$package" 52
+        fail "BAD_PACKAGE_NAME_$package" 53
 
     grep -Fq "Version: $EXPECTED_PACKAGE_VERSION" "$control" ||
-        fail "BAD_PACKAGE_VERSION_$package" 53
+        fail "BAD_PACKAGE_VERSION_$package" 54
 
     grep -q '^Architecture: aarch64_generic$' "$control" ||
-        fail "BAD_ARCH_$package" 54
+        fail "BAD_ARCH_$package" 55
 
     grep -Fq "kernel (= $EXPECTED_KERNEL)" "$control" ||
         grep -Fq "kernel (=$EXPECTED_KERNEL)" "$control" ||
-        fail "BAD_KERNEL_ABI_$package" 55
+        fail "BAD_KERNEL_ABI_$package" 56
 
     extract_ipk_data "$ipk" "$extract_dir" ||
-        fail "BAD_DATA_EXTRACT_$package" 56
+        fail "BAD_DATA_EXTRACT_$package" 57
 
     module_count="$(find "$extract_dir" -type f -name 'rtw88*.ko' | wc -l | tr -d ' ')"
     [ "$module_count" -ge 1 ] ||
-        fail "BAD_MODULE_COUNT_$package" 57
+        fail "BAD_MODULE_COUNT_$package" 58
 
-    cp "$ipk" "$RAW/"
     cp "$ipk" "$ARTIFACT/ipk/"
 done
 
 COUNT="$(find "$ARTIFACT/ipk" -type f -name '*.ipk' | wc -l | tr -d ' ')"
-[ "$COUNT" = 4 ] || fail BAD_FINAL_IPK_COUNT 58
+[ "$COUNT" = 4 ] || fail BAD_FINAL_IPK_COUNT 59
 
 sha256sum "$ARTIFACT"/ipk/*.ipk > "$ARTIFACT/SHA256SUMS"
 
