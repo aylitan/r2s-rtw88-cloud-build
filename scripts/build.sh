@@ -32,6 +32,21 @@ fail() {
     exit "${2:-30}"
 }
 
+set_config_value() {
+    local symbol="$1"
+    local value="$2"
+    sed -i \
+        -e "/^${symbol}=/d" \
+        -e "/^# ${symbol} is not set$/d" \
+        .config
+
+    case "$value" in
+        n) echo "# ${symbol} is not set" >> .config ;;
+        y|m) echo "${symbol}=${value}" >> .config ;;
+        *) echo "${symbol}=${value}" >> .config ;;
+    esac
+}
+
 read_control() {
     local ipk="$1"
     local member tmp
@@ -45,7 +60,22 @@ read_control() {
     rm -f "$tmp"
 }
 
-echo "========== R2S_RTW88_OFFICIAL_SDK_BUILD_BEGIN =========="
+extract_ipk_data() {
+    local ipk="$1"
+    local destination="$2"
+    local member tmp
+
+    member="$(ar t "$ipk" | grep '^data.tar' | head -n 1)"
+    [ -n "$member" ] || return 1
+
+    mkdir -p "$destination"
+    tmp="$(mktemp)"
+    ar p "$ipk" "$member" > "$tmp"
+    tar -xf "$tmp" -C "$destination"
+    rm -f "$tmp"
+}
+
+echo "========== R2S_RTW88_FINAL_EXACT_ABI_BUILD_BEGIN =========="
 date
 echo "SDK_URL=$SDK_URL"
 echo "OPENWRT_TAG=$OPENWRT_TAG"
@@ -53,7 +83,7 @@ echo "EXPECTED_KERNEL=$EXPECTED_KERNEL"
 
 [ -s "$PATCH" ] || fail BAD_PATCH_NOT_FOUND 20
 
-curl -L --fail --retry 5 --retry-delay 3 \
+curl -L --fail --retry 8 --retry-delay 3 \
     -o "$ARCHIVE" "$SDK_URL" ||
     fail BAD_SDK_DOWNLOAD 21
 
@@ -64,7 +94,7 @@ tar --zstd -xf "$ARCHIVE" -C "$SDK" --strip-components=1 ||
     fail BAD_SDK_EXTRACT 23
 
 echo
-echo "===== Fetch only official mac80211 package source ====="
+echo "===== Fetch exact official mac80211 source ====="
 
 git clone \
     --depth 1 \
@@ -93,14 +123,8 @@ cp -a "$SOURCE_MAC80211" "$SDK_MAC80211" ||
 [ -d "$SDK_MAC80211/patches/rtl" ] ||
     fail BAD_SDK_MAC80211_RTL_PATCH_PATH 28
 
-MAC80211_VERSION="$({
-    sed -n 's/^PKG_VERSION:=//p' "$SDK_MAC80211/Makefile" | head -n 1
-} || true)"
-
-MAC80211_RELEASE="$({
-    sed -n 's/^PKG_RELEASE:=//p' "$SDK_MAC80211/Makefile" | head -n 1
-} || true)"
-
+MAC80211_VERSION="$(sed -n 's/^PKG_VERSION:=//p' "$SDK_MAC80211/Makefile" | head -n 1)"
+MAC80211_SOURCE_RELEASE="$(sed -n 's/^PKG_RELEASE:=//p' "$SDK_MAC80211/Makefile" | head -n 1)"
 SOURCE_COMMIT="$(git -C "$OPENWRT_SOURCE" rev-parse HEAD)"
 SOURCE_TAG_COMMIT="$(git -C "$OPENWRT_SOURCE" rev-list -n 1 "$OPENWRT_TAG")"
 
@@ -110,29 +134,19 @@ SOURCE_TAG_COMMIT="$(git -C "$OPENWRT_SOURCE" rev-list -n 1 "$OPENWRT_TAG")"
 [ "$MAC80211_VERSION" = "$EXPECTED_MAC80211_VERSION" ] ||
     fail "BAD_MAC80211_VERSION_${MAC80211_VERSION:-EMPTY}" 30
 
-[ "$MAC80211_RELEASE" = "$EXPECTED_SOURCE_MAC80211_RELEASE" ] ||
-    fail "BAD_SOURCE_MAC80211_RELEASE_${MAC80211_RELEASE:-EMPTY}" 31
+[ "$MAC80211_SOURCE_RELEASE" = "$EXPECTED_SOURCE_MAC80211_RELEASE" ] ||
+    fail "BAD_SOURCE_MAC80211_RELEASE_${MAC80211_SOURCE_RELEASE:-EMPTY}" 31
 
 RELEASE_LINE_COUNT="$(grep -c '^PKG_RELEASE:=1$' "$SDK_MAC80211/Makefile" || true)"
 [ "$RELEASE_LINE_COUNT" = "1" ] ||
     fail "BAD_SOURCE_RELEASE_LINE_COUNT_$RELEASE_LINE_COUNT" 32
 
-sed -i 's/^PKG_RELEASE:=1$/PKG_RELEASE:=2/' \
-    "$SDK_MAC80211/Makefile" ||
+sed -i 's/^PKG_RELEASE:=1$/PKG_RELEASE:=2/' "$SDK_MAC80211/Makefile" ||
     fail BAD_MAC80211_RELEASE_REWRITE 33
 
-MAC80211_TARGET_RELEASE="$({
-    sed -n 's/^PKG_RELEASE:=//p' "$SDK_MAC80211/Makefile" | head -n 1
-} || true)"
-
+MAC80211_TARGET_RELEASE="$(sed -n 's/^PKG_RELEASE:=//p' "$SDK_MAC80211/Makefile" | head -n 1)"
 [ "$MAC80211_TARGET_RELEASE" = "$TARGET_MAC80211_RELEASE" ] ||
     fail "BAD_TARGET_MAC80211_RELEASE_${MAC80211_TARGET_RELEASE:-EMPTY}" 34
-
-echo "OPENWRT_SOURCE_COMMIT=$SOURCE_COMMIT"
-echo "MAC80211_VERSION=$MAC80211_VERSION"
-echo "MAC80211_SOURCE_RELEASE=$MAC80211_RELEASE"
-echo "MAC80211_TARGET_RELEASE=$MAC80211_TARGET_RELEASE"
-echo "SDK_MAC80211_PATH=$SDK_MAC80211"
 
 cp "$PATCH" \
     "$SDK_MAC80211/patches/rtl/999-rtw88-fix-random-error-beacon-valid-usb.patch" ||
@@ -147,16 +161,35 @@ grep -Fq '(bckp[2] & ~BIT_EN_BCN_FUNCTION) | BIT_DIS_TSF_UDT' "$PATCH" ||
 grep -Fq 'rtw_write8(rtwdev, REG_BCN_CTRL, bckp[2]);' "$PATCH" ||
     fail BAD_PATCH_RESTORE 38
 
+echo "OPENWRT_SOURCE_COMMIT=$SOURCE_COMMIT"
+echo "MAC80211_VERSION=$MAC80211_VERSION"
+echo "MAC80211_SOURCE_RELEASE=$MAC80211_SOURCE_RELEASE"
+echo "MAC80211_TARGET_RELEASE=$MAC80211_TARGET_RELEASE"
+
 cd "$SDK"
 
-cat >> .config <<'CONFIG_EOF'
-CONFIG_PACKAGE_kmod-rtw88=m
-CONFIG_PACKAGE_kmod-rtw88-usb=m
-CONFIG_PACKAGE_kmod-rtw88-8822b=m
-CONFIG_PACKAGE_kmod-rtw88-8822bu=m
-CONFIG_EOF
+[ -f .config ] || fail BAD_SDK_CONFIG_NOT_FOUND 39
+cp .config "$LOGS/sdk-original.config"
+
+# The SDK enables ALL_KMODS. Disable it so the mac80211 package does not
+# select the ath10k-smallbuffers variant and compile unrelated drivers.
+set_config_value CONFIG_ALL_KMODS n
+set_config_value CONFIG_ALL_NONSHARED n
+set_config_value CONFIG_PACKAGE_kmod-ath10k-smallbuffers n
+set_config_value CONFIG_PACKAGE_kmod-ath10k n
+
+set_config_value CONFIG_USB_SUPPORT y
+set_config_value CONFIG_DRIVER_11AC_SUPPORT y
+set_config_value CONFIG_PACKAGE_kmod-cfg80211 m
+set_config_value CONFIG_PACKAGE_kmod-mac80211 m
+set_config_value CONFIG_PACKAGE_kmod-usb-core m
+set_config_value CONFIG_PACKAGE_kmod-rtw88 m
+set_config_value CONFIG_PACKAGE_kmod-rtw88-usb m
+set_config_value CONFIG_PACKAGE_kmod-rtw88-8822b m
+set_config_value CONFIG_PACKAGE_kmod-rtw88-8822bu m
 
 make defconfig | tee "$LOGS/defconfig.log"
+cp .config "$LOGS/final.config"
 
 for symbol in \
     CONFIG_PACKAGE_kmod-rtw88 \
@@ -164,45 +197,67 @@ for symbol in \
     CONFIG_PACKAGE_kmod-rtw88-8822b \
     CONFIG_PACKAGE_kmod-rtw88-8822bu
 do
-    grep -q "^${symbol}=m$" .config ||
-        fail "BAD_CONFIG_$symbol" 36
+    grep -Eq "^${symbol}=(m|y)$" .config ||
+        fail "BAD_CONFIG_$symbol" 40
 done
+
+if grep -Eq '^CONFIG_PACKAGE_kmod-ath10k-smallbuffers=(m|y)$' .config; then
+    fail BAD_SMALLBUFFERS_VARIANT_STILL_ENABLED 41
+fi
+
+if grep -Eq '^CONFIG_ALL_KMODS=y$' .config; then
+    fail BAD_ALL_KMODS_STILL_ENABLED 42
+fi
 
 grep -E '^CONFIG_TARGET_rockchip(_armv8)?=y$' .config |
     tee "$LOGS/target-config.txt"
 
-grep -E '^CONFIG_PACKAGE_kmod-rtw88(-usb|-8822b|-8822bu)?=m$' .config |
-    tee "$LOGS/rtw88-config.txt"
+grep -E '^CONFIG_(ALL_KMODS|ALL_NONSHARED|USB_SUPPORT|DRIVER_11AC_SUPPORT|PACKAGE_kmod-(cfg80211|mac80211|usb-core|ath10k-smallbuffers|rtw88|rtw88-usb|rtw88-8822b|rtw88-8822bu))' .config |
+    tee "$LOGS/selected-config.txt" || true
 
 JOBS="$(nproc)"
 [ "$JOBS" -gt 4 ] && JOBS=4
 
 echo
-echo "===== Compile only package/kernel/mac80211 ====="
+echo "===== Prepare mac80211 and verify patch before compile ====="
 
 make package/kernel/mac80211/clean |
     tee "$LOGS/clean.log"
 
+make -j1 package/kernel/mac80211/prepare V=s |
+    tee "$LOGS/prepare.log"
+
+mapfile -t PREPARED_FW_FILES < <(
+    find build_dir \
+        -type f \
+        -path '*/backports-6.12.61/drivers/net/wireless/realtek/rtw88/fw.c' \
+        -print |
+    sort
+)
+
+[ "${#PREPARED_FW_FILES[@]}" -gt 0 ] ||
+    fail BAD_PREPARED_RTW88_SOURCE_NOT_FOUND 43
+
+PATCHED_FW=""
+for candidate in "${PREPARED_FW_FILES[@]}"; do
+    if grep -Fq 'bckp[2] = rtw_read8(rtwdev, REG_BCN_CTRL);' "$candidate" &&
+       grep -Fq 'BIT_DIS_TSF_UDT' "$candidate" &&
+       grep -Fq 'rtw_write8(rtwdev, REG_BCN_CTRL, bckp[2]);' "$candidate"; then
+        PATCHED_FW="$candidate"
+        break
+    fi
+done
+
+[ -n "$PATCHED_FW" ] || fail BAD_PATCH_NOT_APPLIED_TO_PREPARED_SOURCE 44
+
+echo "PATCHED_FW=$PATCHED_FW"
+cp "$PATCHED_FW" "$LOGS/patched-fw.c"
+
+echo
+echo "===== Compile selected RTW88 packages only ====="
+
 make -j"$JOBS" package/kernel/mac80211/compile V=s |
     tee "$LOGS/compile.log"
-
-FW="$(
-    find build_dir \
-        -path '*/backports-6.12.61/drivers/net/wireless/realtek/rtw88/fw.c' \
-        -type f |
-    head -n 1
-)"
-
-[ -n "$FW" ] || fail BAD_PATCHED_SOURCE_NOT_FOUND 40
-
-grep -Fq 'bckp[2] = rtw_read8(rtwdev, REG_BCN_CTRL);' "$FW" ||
-    fail BAD_PATCH_NOT_APPLIED_BACKUP 41
-
-grep -Fq 'BIT_DIS_TSF_UDT' "$FW" ||
-    fail BAD_PATCH_NOT_APPLIED_DISABLE 42
-
-grep -Fq 'rtw_write8(rtwdev, REG_BCN_CTRL, bckp[2]);' "$FW" ||
-    fail BAD_PATCH_NOT_APPLIED_RESTORE 43
 
 PACKAGES=(
     kmod-rtw88
@@ -211,17 +266,24 @@ PACKAGES=(
     kmod-rtw88-8822bu
 )
 
-for package in "${PACKAGES[@]}"
-do
+mkdir -p "$LOGS/ipk-extracted"
+
+for package in "${PACKAGES[@]}"; do
     mapfile -t files < <(
-        find bin -type f -name "${package}_*.ipk" | sort
+        find bin/targets/rockchip/armv8/packages \
+            -maxdepth 1 \
+            -type f \
+            -name "${package}_${EXPECTED_PACKAGE_VERSION}_aarch64_generic.ipk" \
+            -print |
+        sort
     )
 
     [ "${#files[@]}" -eq 1 ] ||
-        fail "BAD_IPK_COUNT_$package" 50
+        fail "BAD_IPK_COUNT_${package}_${#files[@]}" 50
 
     ipk="${files[0]}"
     control="$LOGS/${package}.control"
+    extract_dir="$LOGS/ipk-extracted/$package"
 
     read_control "$ipk" > "$control" ||
         fail "BAD_CONTROL_$package" 51
@@ -241,28 +303,30 @@ do
         grep -Fq "kernel (=$EXPECTED_KERNEL)" "$control" ||
         fail "BAD_KERNEL_ABI_$package" 55
 
+    extract_ipk_data "$ipk" "$extract_dir" ||
+        fail "BAD_DATA_EXTRACT_$package" 56
+
+    module_count="$(find "$extract_dir" -type f -name 'rtw88*.ko' | wc -l | tr -d ' ')"
+    [ "$module_count" -ge 1 ] ||
+        fail "BAD_MODULE_COUNT_$package" 57
+
     cp "$ipk" "$RAW/"
     cp "$ipk" "$ARTIFACT/ipk/"
 done
 
-COUNT="$(
-    find "$ARTIFACT/ipk" -type f -name '*.ipk' |
-    wc -l |
-    tr -d ' '
-)"
-
-[ "$COUNT" = 4 ] || fail BAD_FINAL_IPK_COUNT 56
+COUNT="$(find "$ARTIFACT/ipk" -type f -name '*.ipk' | wc -l | tr -d ' ')"
+[ "$COUNT" = 4 ] || fail BAD_FINAL_IPK_COUNT 58
 
 sha256sum "$ARTIFACT"/ipk/*.ipk > "$ARTIFACT/SHA256SUMS"
 
 cat > "$ARTIFACT/BUILD_INFO.txt" <<INFO_EOF
 RESULT=OK_R2S_RTW88_PATCHED_EXACT_ABI_BUILD
-SOURCE=official OpenWrt 24.10.7 rockchip/armv8 SDK plus sparse official v24.10.7 mac80211 source
+SOURCE=official OpenWrt 24.10.7 rockchip/armv8 SDK plus official v24.10.7 mac80211 source
 OPENWRT_SOURCE_COMMIT=$SOURCE_COMMIT
 KERNEL_DEPENDENCY=$EXPECTED_KERNEL
 MAC80211_BACKPORTS=$MAC80211_VERSION-r$MAC80211_TARGET_RELEASE
-MAC80211_SOURCE_RELEASE=$MAC80211_RELEASE
 PATCH_COMMIT=f24d0d8c3cd7
+PATCHED_FW=$PATCHED_FW
 IPK_COUNT=$COUNT
 INFO_EOF
 
@@ -271,12 +335,11 @@ cat > "$ARTIFACT/INSTALL_ORDER.txt" <<'ORDER_EOF'
 2. kmod-rtw88-usb
 3. kmod-rtw88-8822b
 4. kmod-rtw88-8822bu
-Do not install before backing up the existing modules.
+Do not install before backing up the current IPKs and modules.
 ORDER_EOF
 
 echo "RESULT=OK_R2S_RTW88_PATCHED_EXACT_ABI_BUILD" |
     tee "$LOGS/result.txt"
-
 echo "IPK_COUNT=$COUNT"
 echo "ARTIFACT=$ARTIFACT"
-echo "========== R2S_RTW88_OFFICIAL_SDK_BUILD_END =========="
+echo "========== R2S_RTW88_FINAL_EXACT_ABI_BUILD_END =========="
