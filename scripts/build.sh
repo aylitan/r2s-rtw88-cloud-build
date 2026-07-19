@@ -168,11 +168,14 @@ echo "MAC80211_TARGET_RELEASE=$MAC80211_TARGET_RELEASE"
 
 cd "$SDK"
 
-[ -f .config ] || fail BAD_SDK_CONFIG_NOT_FOUND 39
-cp .config "$LOGS/sdk-original.config"
+# Some official target SDK archives do not ship a pre-generated .config.
+# Create it explicitly, seed the fixed SDK target, disable the three
+# build-everything switches, and select only the four RTW88 packages.
+: > .config
 
-# The SDK enables ALL_KMODS. Disable it so the mac80211 package does not
-# select the ath10k-smallbuffers variant and compile unrelated drivers.
+set_config_value CONFIG_TARGET_rockchip y
+set_config_value CONFIG_TARGET_rockchip_armv8 y
+set_config_value CONFIG_ALL n
 set_config_value CONFIG_ALL_KMODS n
 set_config_value CONFIG_ALL_NONSHARED n
 set_config_value CONFIG_PACKAGE_kmod-ath10k-smallbuffers n
@@ -189,6 +192,7 @@ set_config_value CONFIG_PACKAGE_kmod-rtw88-8822b m
 set_config_value CONFIG_PACKAGE_kmod-rtw88-8822bu m
 
 make defconfig | tee "$LOGS/defconfig.log"
+[ -s .config ] || fail BAD_SDK_CONFIG_GENERATION 39
 cp .config "$LOGS/final.config"
 
 for symbol in \
