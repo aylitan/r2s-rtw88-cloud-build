@@ -18,7 +18,9 @@ OPENWRT_REPO="https://github.com/openwrt/openwrt.git"
 OPENWRT_TAG="v24.10.7"
 EXPECTED_KERNEL="6.6.141~77d4782035a23e6f19f9c4751451b4e3-r1"
 EXPECTED_MAC80211_VERSION="6.12.61"
-EXPECTED_MAC80211_RELEASE="2"
+EXPECTED_SOURCE_MAC80211_RELEASE="1"
+TARGET_MAC80211_RELEASE="2"
+EXPECTED_PACKAGE_VERSION="6.6.141.6.12.61-r2"
 PATCH="$ROOT/patches/999-rtw88-fix-random-error-beacon-valid-usb.patch"
 
 rm -rf "$OUT" "$RUN"
@@ -108,26 +110,42 @@ SOURCE_TAG_COMMIT="$(git -C "$OPENWRT_SOURCE" rev-list -n 1 "$OPENWRT_TAG")"
 [ "$MAC80211_VERSION" = "$EXPECTED_MAC80211_VERSION" ] ||
     fail "BAD_MAC80211_VERSION_${MAC80211_VERSION:-EMPTY}" 30
 
-[ "$MAC80211_RELEASE" = "$EXPECTED_MAC80211_RELEASE" ] ||
-    fail "BAD_MAC80211_RELEASE_${MAC80211_RELEASE:-EMPTY}" 31
+[ "$MAC80211_RELEASE" = "$EXPECTED_SOURCE_MAC80211_RELEASE" ] ||
+    fail "BAD_SOURCE_MAC80211_RELEASE_${MAC80211_RELEASE:-EMPTY}" 31
+
+RELEASE_LINE_COUNT="$(grep -c '^PKG_RELEASE:=1$' "$SDK_MAC80211/Makefile" || true)"
+[ "$RELEASE_LINE_COUNT" = "1" ] ||
+    fail "BAD_SOURCE_RELEASE_LINE_COUNT_$RELEASE_LINE_COUNT" 32
+
+sed -i 's/^PKG_RELEASE:=1$/PKG_RELEASE:=2/' \
+    "$SDK_MAC80211/Makefile" ||
+    fail BAD_MAC80211_RELEASE_REWRITE 33
+
+MAC80211_TARGET_RELEASE="$({
+    sed -n 's/^PKG_RELEASE:=//p' "$SDK_MAC80211/Makefile" | head -n 1
+} || true)"
+
+[ "$MAC80211_TARGET_RELEASE" = "$TARGET_MAC80211_RELEASE" ] ||
+    fail "BAD_TARGET_MAC80211_RELEASE_${MAC80211_TARGET_RELEASE:-EMPTY}" 34
 
 echo "OPENWRT_SOURCE_COMMIT=$SOURCE_COMMIT"
 echo "MAC80211_VERSION=$MAC80211_VERSION"
-echo "MAC80211_RELEASE=$MAC80211_RELEASE"
+echo "MAC80211_SOURCE_RELEASE=$MAC80211_RELEASE"
+echo "MAC80211_TARGET_RELEASE=$MAC80211_TARGET_RELEASE"
 echo "SDK_MAC80211_PATH=$SDK_MAC80211"
 
 cp "$PATCH" \
     "$SDK_MAC80211/patches/rtl/999-rtw88-fix-random-error-beacon-valid-usb.patch" ||
-    fail BAD_PATCH_COPY 32
+    fail BAD_PATCH_COPY 35
 
 grep -Fq 'bckp[2] = rtw_read8(rtwdev, REG_BCN_CTRL);' "$PATCH" ||
-    fail BAD_PATCH_BACKUP 33
+    fail BAD_PATCH_BACKUP 36
 
 grep -Fq '(bckp[2] & ~BIT_EN_BCN_FUNCTION) | BIT_DIS_TSF_UDT' "$PATCH" ||
-    fail BAD_PATCH_DISABLE 34
+    fail BAD_PATCH_DISABLE 37
 
 grep -Fq 'rtw_write8(rtwdev, REG_BCN_CTRL, bckp[2]);' "$PATCH" ||
-    fail BAD_PATCH_RESTORE 35
+    fail BAD_PATCH_RESTORE 38
 
 cd "$SDK"
 
@@ -213,12 +231,15 @@ do
     grep -q "^Package: $package$" "$control" ||
         fail "BAD_PACKAGE_NAME_$package" 52
 
+    grep -Fq "Version: $EXPECTED_PACKAGE_VERSION" "$control" ||
+        fail "BAD_PACKAGE_VERSION_$package" 53
+
     grep -q '^Architecture: aarch64_generic$' "$control" ||
-        fail "BAD_ARCH_$package" 53
+        fail "BAD_ARCH_$package" 54
 
     grep -Fq "kernel (= $EXPECTED_KERNEL)" "$control" ||
         grep -Fq "kernel (=$EXPECTED_KERNEL)" "$control" ||
-        fail "BAD_KERNEL_ABI_$package" 54
+        fail "BAD_KERNEL_ABI_$package" 55
 
     cp "$ipk" "$RAW/"
     cp "$ipk" "$ARTIFACT/ipk/"
@@ -230,7 +251,7 @@ COUNT="$(
     tr -d ' '
 )"
 
-[ "$COUNT" = 4 ] || fail BAD_FINAL_IPK_COUNT 55
+[ "$COUNT" = 4 ] || fail BAD_FINAL_IPK_COUNT 56
 
 sha256sum "$ARTIFACT"/ipk/*.ipk > "$ARTIFACT/SHA256SUMS"
 
@@ -239,7 +260,8 @@ RESULT=OK_R2S_RTW88_PATCHED_EXACT_ABI_BUILD
 SOURCE=official OpenWrt 24.10.7 rockchip/armv8 SDK plus sparse official v24.10.7 mac80211 source
 OPENWRT_SOURCE_COMMIT=$SOURCE_COMMIT
 KERNEL_DEPENDENCY=$EXPECTED_KERNEL
-MAC80211_BACKPORTS=$MAC80211_VERSION-r$MAC80211_RELEASE
+MAC80211_BACKPORTS=$MAC80211_VERSION-r$MAC80211_TARGET_RELEASE
+MAC80211_SOURCE_RELEASE=$MAC80211_RELEASE
 PATCH_COMMIT=f24d0d8c3cd7
 IPK_COUNT=$COUNT
 INFO_EOF
